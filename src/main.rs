@@ -1,19 +1,71 @@
-use pulldown_cmark::{Parser, Event, Tag};
-use std::fs;
+use chrono::{DateTime, Duration, Local};
+use diffy::create_patch;
+use failure::{format_err, Error, Fail};
 use futures::future::{select_all, BoxFuture, FutureExt};
-use std::collections::{BTreeSet, BTreeMap};
-use serde::{Serialize, Deserialize};
 use lazy_static::lazy_static;
-use std::time;
-use log::{warn, debug, info};
-use std::io::Write;
-use reqwest::{Client, redirect::Policy, StatusCode, header, Url};
+use log::{debug, info, warn};
+use pulldown_cmark::{Event, Parser, Tag};
 use regex::Regex;
-use failure::{Fail, Error, format_err};
-use chrono::{Local, DateTime, Duration};
+use reqwest::{header, redirect::Policy, Client, StatusCode, Url};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::io::Write;
+use std::time;
+use std::u8;
+use std::{cmp::Ordering, fs};
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+
+const MINIMUM_GITHUB_STARS: u32 = 50;
+const MINIMUM_CARGO_DOWNLOADS: u32 = 2000;
+
+// Allow overriding the needed stars for a section. "level" is the header level in the markdown, default is MINIMUM_GITHUB_STARS
+// In general, we should just use the defaults. However, for some areas where there's not a lot of well-starred projects, but a
+// a few that are say just below the thresholds, then it's worth reducing the thresholds so we can get a few more projects.
+fn override_stars(level: u32, text: &str) -> Option<u32> {
+    if level == 2 && text.contains("Resources") {
+        // This is zero because a lot of the resources are non-github/non-cargo links and overriding for all would be annoying
+        // These should be evaluated with more primitive means
+        Some(0)
+    } else if level == 3 && text.contains("Games") {
+        Some(40)
+    } else if level == 3 && text.contains("Emulators") {
+        Some(40)
+    } else {
+        None // i.e. use defaults
+    }
+}
+
+lazy_static! {
+    // Overrides for popularity count, each needs a good reason (i.e. downloads/stars we don't support automatic counting of)
+    // Each is a URL that's "enough" for an item to pass the popularity checks
+    static ref POPULARITY_OVERRIDES: Vec<String> = vec![
+        "https://github.com/maidsafe".to_string(), // Many repos of Rust code, collectively > 50 stars
+        "https://pijul.org".to_string(), // Uses it's own VCS at https://nest.pijul.com/pijul/pijul with 190 stars at last check
+        "https://gitlab.com/veloren/veloren".to_string(), // No direct gitlab support, but >1000 stars there
+        "https://gitlab.redox-os.org/redox-os/redox".to_string(), // 394 stars
+        "https://amp.rs".to_string(), // https://github.com/jmacdonald/amp has 2.9k stars
+        "https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb".to_string(), // > 350k downloads
+        "https://gitpod.io".to_string(), // https://github.com/gitpod-io/gitpod has 4.7k stars
+        "https://wiki.gnome.org/Apps/Builder".to_string(), // https://gitlab.gnome.org/GNOME/gnome-builder has 133 stars
+        "https://marketplace.visualstudio.com/items?itemName=bungcip.better-toml".to_string(), // > 860k downloads
+        "https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer".to_string(), // > 260k downloads
+        "https://marketplace.visualstudio.com/items?itemName=rust-lang.rust".to_string(), // > 1M downloads
+        "https://docs.rs".to_string(), // https://github.com/rust-lang/docs.rs has >600 stars
+        "https://github.com/rust-bio".to_string(), // https://github.com/rust-bio/rust-bio on it's own has >900 stars
+        "https://github.com/contain-rs".to_string(), // Lots of repos with good star counts
+        "https://github.com/georust".to_string(), // Lots of repos with good star counts
+        "http://kiss3d.org".to_string(), // https://github.com/sebcrozet/kiss3d has >900 stars
+        "https://github.com/rust-qt".to_string(), // Various high-stars repositories
+        "https://chromium.googlesource.com/chromiumos/platform/crosvm/".to_string(), // Can't tell count directly, but various mirrors of it (e.g. https://github.com/dgreid/crosvm) have enough stars that it's got enough interest
+        "https://seed-rs.org/".to_string(), // https://github.com/seed-rs/seed has 2.1k stars
+        "https://crates.io".to_string(), // This one gets a free pass :)
+        "https://cloudsmith.com/cargo-registry/".to_string(), // First private cargo registry (https://cloudsmith.com/blog/worlds-first-private-cargo-registry-w-cloudsmith-rust/) and not much in the way of other options yet. See also https://github.com/rust-unofficial/awesome-rust/pull/1141#discussion_r688711555
+        "https://gitlab.com/ttyperacer/terminal-typeracer".to_string(), // GitLab repo with >40 stars.
+        "https://github.com/esp-rs".to_string(), // Espressif Rust Organization (Organizations have no stars).
+    ];
+}
 
 #[derive(Debug, Fail, Serialize, Deserialize)]
 enum CheckerError {
@@ -26,41 +78,34 @@ enum CheckerError {
         location: Option<String>,
     },
 
+    #[fail(display = "too many requests")]
+    TooManyRequests,
+
     #[fail(display = "reqwest error: {}", error)]
-    ReqwestError {
-        error: String,
-    },
+    ReqwestError { error: String },
 
     #[fail(display = "travis build is unknown")]
     TravisBuildUnknown,
 
     #[fail(display = "travis build image with no branch")]
     TravisBuildNoBranch,
-
-    #[fail(display = "github actions image with no branch")]
-    GithubActionNoBranch,
 }
 
 fn formatter(err: &CheckerError, url: &String) -> String {
     match err {
-        CheckerError::HttpError {status, location} => {
-            match location {
-                Some(loc) => {
-                    format!("[{}] {} -> {}", status, url, loc)
-                }
-                None => {
-                    format!("[{}] {}", status, url)
-                }
+        CheckerError::HttpError { status, location } => match location {
+            Some(loc) => {
+                format!("[{}] {} -> {}", status, url, loc)
             }
-        }
+            None => {
+                format!("[{}] {}", status, url)
+            }
+        },
         CheckerError::TravisBuildUnknown => {
             format!("[Unknown travis build] {}", url)
         }
         CheckerError::TravisBuildNoBranch => {
             format!("[Travis build image with no branch specified] {}", url)
-        }
-        CheckerError::GithubActionNoBranch => {
-            format!("[Github action image with no branch specified] {}", url)
         }
         _ => {
             format!("{:?}", err)
@@ -69,16 +114,18 @@ fn formatter(err: &CheckerError, url: &String) -> String {
 }
 
 struct MaxHandles {
-    remaining: Semaphore
+    remaining: Semaphore,
 }
 
 struct Handle<'a> {
-    _permit: SemaphorePermit<'a>
+    _permit: SemaphorePermit<'a>,
 }
 
 impl MaxHandles {
     fn new(max: usize) -> MaxHandles {
-        MaxHandles { remaining: Semaphore::new(max) }
+        MaxHandles {
+            remaining: Semaphore::new(max),
+        }
     }
 
     async fn get<'a>(&'a self) -> Handle<'a> {
@@ -111,7 +158,84 @@ fn get_url(url: String) -> BoxFuture<'static, (String, Result<(), CheckerError>)
     async move {
         let _handle = HANDLES.get().await;
         return get_url_core(url).await;
-    }.boxed()
+    }
+    .boxed()
+}
+
+lazy_static! {
+    static ref GITHUB_REPO_REGEX: Regex =
+        Regex::new(r"^https://github.com/(?P<org>[^/]+)/(?P<repo>[^/]+)(.*)").unwrap();
+    static ref GITHUB_API_REGEX: Regex = Regex::new(r"https://api.github.com/").unwrap();
+    static ref CRATE_REGEX: Regex =
+        Regex::new(r"https://crates.io/crates/(?P<crate>[^/]+)/?$").unwrap();
+}
+
+#[derive(Deserialize, Debug)]
+struct GithubStars {
+    stargazers_count: u32,
+}
+
+async fn get_stars(github_url: &str) -> Option<u32> {
+    warn!("Downloading Github stars for {}", github_url);
+    let rewritten = GITHUB_REPO_REGEX
+        .replace_all(&github_url, "https://api.github.com/repos/$org/$repo")
+        .to_string();
+    let mut req = CLIENT.get(&rewritten);
+    if let Ok(username) = env::var("GITHUB_USERNAME") {
+        if let Ok(password) = env::var("GITHUB_TOKEN") {
+            // needs a token with at least public_repo scope
+            req = req.basic_auth(username, Some(password));
+        }
+    }
+
+    let resp = req.send().await;
+    match resp {
+        Err(err) => {
+            warn!("Error while getting {}: {}", github_url, err);
+            return None;
+        }
+        Ok(ok) => {
+            let raw = ok.text().await.unwrap();
+            let data = match serde_json::from_str::<GithubStars>(&raw) {
+                Ok(val) => val,
+                Err(_) => {
+                    panic!("{:?}", raw);
+                }
+            };
+            return Some(data.stargazers_count);
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct CrateInfo {
+    downloads: u64,
+}
+
+#[derive(Deserialize, Debug)]
+struct Crate {
+    #[serde(rename = "crate")]
+    info: CrateInfo,
+}
+
+async fn get_downloads(github_url: &str) -> Option<u64> {
+    warn!("Downloading Crates downloads for {}", github_url);
+    let rewritten = CRATE_REGEX
+        .replace_all(&github_url, "https://crates.io/api/v1/crates/$crate")
+        .to_string();
+    let req = CLIENT.get(&rewritten);
+
+    let resp = req.send().await;
+    match resp {
+        Err(err) => {
+            warn!("Error while getting {}: {}", github_url, err);
+            return None;
+        }
+        Ok(ok) => {
+            let data = ok.json::<Crate>().await.unwrap();
+            return Some(data.info.downloads);
+        }
+    }
 }
 
 fn get_url_core(url: String) -> BoxFuture<'static, (String, Result<(), CheckerError>)> {
@@ -119,10 +243,6 @@ fn get_url_core(url: String) -> BoxFuture<'static, (String, Result<(), CheckerEr
         let mut res = Err(CheckerError::NotTried);
         for _ in 0..5u8 {
             debug!("Running {}", url);
-            lazy_static! {
-                static ref GITHUB_REPO_REGEX: Regex = Regex::new(r"^https://github.com/(?P<org>[^/]+)/(?P<repo>[^/]+)$").unwrap();
-                static ref GITHUB_API_REGEX: Regex = Regex::new(r"https://api.github.com/").unwrap();
-            }
             if env::var("GITHUB_USERNAME").is_ok() && env::var("GITHUB_TOKEN").is_ok() && GITHUB_REPO_REGEX.is_match(&url) {
                 let rewritten = GITHUB_REPO_REGEX.replace_all(&url, "https://api.github.com/repos/$org/$repo");
                 info!("Replacing {} with {} to workaround rate limits on Github", url, rewritten);
@@ -191,6 +311,12 @@ fn get_url_core(url: String) -> BoxFuture<'static, (String, Result<(), CheckerEr
                             return (url, res);
                         }
 
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            // We get a lot of these, and we should not retry as they'll just fail again
+                            warn!("Error while getting {}: {}", url, status);
+                            return (url, Err(CheckerError::TooManyRequests));
+                        }
+
                         warn!("Error while getting {}, retrying: {}", url, status);
                         if status.is_redirection() {
                             res = Err(CheckerError::HttpError {status: status.as_u16(), location: ok.headers().get(header::LOCATION).and_then(|h| h.to_str().ok()).map(|x| x.to_string())});
@@ -218,14 +344,6 @@ fn get_url_core(url: String) -> BoxFuture<'static, (String, Result<(), CheckerEr
                             break;
                         }
                     }
-                    if let Some(matches) = GITHUB_ACTIONS_REGEX.captures(&url) {
-                        debug!("Github actions match {:?}", matches);
-                        let query = matches.get(1).map(|x| x.as_str()).unwrap_or("");
-                        if !query.starts_with("?") || query.find("branch=").is_none() {
-                            res = Err(CheckerError::GithubActionNoBranch);
-                            break;
-                        }
-                    }
                     debug!("Finished {}", url);
                     res = Ok(());
                     break;
@@ -239,7 +357,7 @@ fn get_url_core(url: String) -> BoxFuture<'static, (String, Result<(), CheckerEr
 #[derive(Debug, Serialize, Deserialize)]
 enum Working {
     Yes,
-    No(CheckerError)
+    No(CheckerError),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +368,12 @@ struct Link {
 }
 
 type Results = BTreeMap<String, Link>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PopularityData {
+    pub github_stars: BTreeMap<String, u32>,
+    pub cargo_downloads: BTreeMap<String, u32>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -263,12 +387,23 @@ async fn main() -> Result<(), Error> {
         .and_then(|x| serde_yaml::from_str(&x).map_err(|e| format_err!("{}", e)))
         .unwrap_or(Results::new());
 
+    let mut popularity_data: PopularityData = fs::read_to_string("results/popularity.yaml")
+        .map_err(|e| format_err!("{}", e))
+        .and_then(|x| serde_yaml::from_str(&x).map_err(|e| format_err!("{}", e)))
+        .unwrap_or(PopularityData {
+            github_stars: BTreeMap::new(),
+            cargo_downloads: BTreeMap::new(),
+        });
+
     let mut url_checks = vec![];
 
     let min_between_checks: Duration = Duration::days(3);
     let max_allowed_failed: Duration = Duration::days(7);
     let mut do_check = |url: String| {
         if !url.starts_with("http") {
+            return;
+        }
+        if used.contains(&url) {
             return;
         }
         used.insert(url.clone());
@@ -284,21 +419,221 @@ async fn main() -> Result<(), Error> {
         url_checks.push(check);
     };
 
+    let mut to_check: Vec<String> = vec![];
+
+    #[derive(Debug)]
+    struct ListInfo {
+        data: Vec<String>,
+    }
+
+    let mut list_items: Vec<ListInfo> = Vec::new();
+    let mut in_list_item = false;
+    let mut list_item: String = String::new();
+
+    let mut link_count: u8 = 0;
+    let mut github_stars: Option<u32> = None;
+    let mut cargo_downloads: Option<u32> = None;
+
+    let mut required_stars: u32 = MINIMUM_GITHUB_STARS;
+    let mut last_level: u32 = 0;
+    let mut star_override_level: Option<u32> = None;
+
     for (event, _range) in parser.into_offset_iter() {
         match event {
             Event::Start(tag) => {
                 match tag {
                     Tag::Link(_link_type, url, _title) | Tag::Image(_link_type, url, _title) => {
-                        do_check(url.to_string());
+                        if !url.starts_with("#") {
+                            let new_url = url.to_string();
+                            if POPULARITY_OVERRIDES.contains(&new_url) {
+                                github_stars = Some(MINIMUM_GITHUB_STARS);
+                            } else if GITHUB_REPO_REGEX.is_match(&url) {
+                                let github_url = GITHUB_REPO_REGEX
+                                    .replace_all(&url, "https://github.com/$org/$repo")
+                                    .to_string();
+                                let existing = popularity_data.github_stars.get(&github_url);
+                                if let Some(stars) = existing {
+                                    // Use existing star data, but re-retrieve url to check aliveness
+                                    // Some will have overrides, so don't check the regex yet
+                                    github_stars = Some(*stars)
+                                } else {
+                                    github_stars = get_stars(&github_url).await;
+                                    if let Some(raw_stars) = github_stars {
+                                        popularity_data
+                                            .github_stars
+                                            .insert(github_url.to_string(), raw_stars);
+                                        if raw_stars >= required_stars {
+                                            fs::write(
+                                                "results/popularity.yaml",
+                                                serde_yaml::to_string(&popularity_data)?,
+                                            )?;
+                                        }
+                                        link_count += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if CRATE_REGEX.is_match(&url) {
+                                let existing = popularity_data.cargo_downloads.get(&new_url);
+                                if let Some(downloads) = existing {
+                                    cargo_downloads = Some(*downloads);
+                                } else {
+                                    let raw_downloads = get_downloads(&url).await;
+                                    if let Some(positive_downloads) = raw_downloads {
+                                        cargo_downloads = Some(
+                                            positive_downloads.clamp(0, u32::MAX as u64) as u32,
+                                        );
+                                        popularity_data
+                                            .cargo_downloads
+                                            .insert(new_url, cargo_downloads.unwrap());
+                                        if cargo_downloads.unwrap_or(0) >= MINIMUM_CARGO_DOWNLOADS {
+                                            fs::write(
+                                                "results/popularity.yaml",
+                                                serde_yaml::to_string(&popularity_data)?,
+                                            )?;
+                                        }
+                                    }
+                                    link_count += 1;
+                                    continue;
+                                }
+                            }
+
+                            to_check.push(url.to_string());
+                            link_count += 1;
+                        }
+                    }
+                    Tag::List(_) => {
+                        if in_list_item && list_item.len() > 0 {
+                            list_items.last_mut().unwrap().data.push(list_item.clone());
+                            in_list_item = false;
+                        }
+                        list_items.push(ListInfo { data: Vec::new() });
+                    }
+                    Tag::Item => {
+                        if in_list_item && list_item.len() > 0 {
+                            list_items.last_mut().unwrap().data.push(list_item.clone());
+                        }
+                        in_list_item = true;
+                        list_item = String::new();
+                        link_count = 0;
+                        github_stars = None;
+                        cargo_downloads = None;
+                    }
+                    Tag::Heading(level) => {
+                        last_level = level;
+                        if let Some(override_level) = star_override_level {
+                            if level == override_level {
+                                star_override_level = None;
+                                required_stars = MINIMUM_GITHUB_STARS;
+                            }
+                        }
+                    }
+                    Tag::Paragraph => {}
+                    _ => {
+                        if in_list_item {
+                            in_list_item = false;
+                        }
+                    }
+                }
+            }
+            Event::Text(text) => {
+                let possible_override = override_stars(last_level, &text);
+                if let Some(override_value) = possible_override {
+                    star_override_level = Some(last_level);
+                    required_stars = override_value;
+                }
+
+                if in_list_item {
+                    list_item.push_str(&text);
+                }
+            }
+            Event::End(tag) => {
+                match tag {
+                    Tag::Item => {
+                        if list_item.len() > 0 {
+                            if link_count > 0 {
+                                if github_stars.unwrap_or(0) < required_stars
+                                    && cargo_downloads.unwrap_or(0) < MINIMUM_CARGO_DOWNLOADS
+                                {
+                                    if github_stars.is_none() {
+                                        warn!("No valid github link");
+                                    }
+                                    if cargo_downloads.is_none() {
+                                        warn!("No valid crates link");
+                                    }
+                                    return Err(format_err!("Not high enough metrics ({:?} stars < {}, and {:?} cargo downloads < {}): {}", github_stars, required_stars, cargo_downloads, MINIMUM_CARGO_DOWNLOADS, list_item));
+                                }
+                            }
+                            list_items.last_mut().unwrap().data.push(list_item.clone());
+                            list_item = String::new();
+                        }
+                        in_list_item = false
+                    }
+                    Tag::List(_) => {
+                        let list_info = list_items.pop().unwrap();
+                        if list_info.data.iter().find(|s| *s == "License").is_some()
+                            && list_info.data.iter().find(|s| *s == "Resources").is_some()
+                        {
+                            // Ignore wrong ordering in top-level list
+                            continue;
+                        }
+                        let mut sorted_recent_list = list_info.data.to_vec();
+                        sorted_recent_list.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                        let joined_recent = list_info.data.join("\n");
+                        let joined_sorted = sorted_recent_list.join("\n");
+                        let patch = create_patch(&joined_recent, &joined_sorted);
+                        if patch.hunks().len() > 0 {
+                            println!("{}", patch);
+                            return Err(format_err!("Sorting error"));
+                        }
                     }
                     _ => {}
                 }
             }
             Event::Html(content) => {
-                return Err(format_err!("Contains HTML content, not markdown: {}", content));
+                return Err(format_err!(
+                    "Contains HTML content, not markdown: {}",
+                    content
+                ));
             }
             _ => {}
         }
+    }
+    fs::write(
+        "results/popularity.yaml",
+        serde_yaml::to_string(&popularity_data)?,
+    )?;
+
+    to_check.sort_by(|a, b| {
+        let get_time = |k| {
+            let res = results.get(k);
+            if let Some(link) = res {
+                if let Some(last_working) = link.last_working {
+                    Some(last_working)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let res_a = get_time(a);
+        let res_b = get_time(b);
+        if res_a.is_none() {
+            if res_b.is_none() {
+                return a.cmp(b);
+            } else {
+                Ordering::Less
+            }
+        } else if res_b.is_none() {
+            Ordering::Greater
+        } else {
+            res_a.unwrap().cmp(&res_b.unwrap())
+        }
+    });
+
+    for url in to_check {
+        do_check(url)
     }
 
     let results_keys = results.keys().cloned().collect::<BTreeSet<String>>();
@@ -322,24 +657,30 @@ async fn main() -> Result<(), Error> {
                     link.last_working = Some(Local::now());
                     link.working = Working::Yes;
                 } else {
-                    results.insert(url.clone(), Link {
-                        updated_at: Local::now(),
-                        last_working: Some(Local::now()),
-                        working: Working::Yes
-                    });
+                    results.insert(
+                        url.clone(),
+                        Link {
+                            updated_at: Local::now(),
+                            last_working: Some(Local::now()),
+                            working: Working::Yes,
+                        },
+                    );
                 }
-            },
+            }
             Err(err) => {
                 print!("\u{2718} ");
                 if let Some(link) = results.get_mut(&url) {
                     link.updated_at = Local::now();
                     link.working = Working::No(err);
                 } else {
-                    results.insert(url.clone(), Link {
-                        updated_at: Local::now(),
-                        working: Working::No(err),
-                        last_working: None
-                    });
+                    results.insert(
+                        url.clone(),
+                        Link {
+                            updated_at: Local::now(),
+                            working: Working::No(err),
+                            last_working: None,
+                        },
+                    );
                 }
             }
         }
@@ -360,10 +701,22 @@ async fn main() -> Result<(), Error> {
     for (url, link) in results.iter() {
         if let Working::No(ref err) = link.working {
             match err {
-                CheckerError::HttpError {status, ..} if *status == 301 || *status == 302 || *status == 404 => {
+                CheckerError::HttpError { status, .. }
+                    if *status == 301 || *status == 302 || *status == 404 =>
+                {
                     println!("{} {:?}", url, link);
-                    failed +=1;
+                    failed += 1;
                     continue;
+                }
+                CheckerError::TooManyRequests => {
+                    // too many tries
+                    if link.last_working.is_some() {
+                        info!(
+                            "Ignoring 429 failure on {} as we've seen success before",
+                            url
+                        );
+                        continue;
+                    }
                 }
                 _ => {}
             };
@@ -371,13 +724,17 @@ async fn main() -> Result<(), Error> {
                 let since = Local::now() - last_working;
                 if since > max_allowed_failed {
                     println!("{} {:?}", url, link);
-                    failed +=1;
+                    failed += 1;
                 } else {
-                    println!("Failure occurred but only {}, so we're not worrying yet: {}", chrono_humanize::HumanTime::from(-since), formatter(err, url));
+                    println!(
+                        "Failure occurred but only {}, so we're not worrying yet: {}",
+                        chrono_humanize::HumanTime::from(-since),
+                        formatter(err, url)
+                    );
                 }
             } else {
                 println!("{} {:?}", url, link);
-                failed +=1;
+                failed += 1;
                 continue;
             }
         }
